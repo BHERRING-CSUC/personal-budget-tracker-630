@@ -1,0 +1,35 @@
+{
+  "name": "Budget Tracker (Java + PostgreSQL)",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/personal-budget-tracker-630",
+
+  "forwardPorts": [8080, 5432],
+  "portsAttributes": {
+    "8080": {
+      "label": "Spring Boot App",
+      "onAutoForward": "notify"
+    },
+    "5432": {
+      "label": "PostgreSQL",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "postCreateCommand": "chmod +x budgettracker/mvnw && cd budgettracker && ./mvnw clean package -DskipTests",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "vmware.vscode-spring-boot",
+        "redhat.vscode-xml"
+      ],
+      "settings": {
+        "java.server.launchMode": "Standard"
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}
