@@ -16,7 +16,7 @@
     }
   },
 
-  "postCreateCommand": "chmod +x budgettracker/mvnw && cd budgettracker && ./mvnw clean package -DskipTests",
+  "postCreateCommand": "chmod +x budgettracker/mvnw",
 
   "customizations": {
     "vscode": {
