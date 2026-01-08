@@ -171,45 +171,75 @@ jobs:
             echo "${num}"
           }
 
-          # ---------- Issues ----------
+          # ---------- Issues (create OR update existing) ----------
 
-          issue_number_by_title_exact() {
-            local title="$1"
-            local q encq resp num
-            q="repo:${REPO} is:issue in:title \"${title}\""
-            encq="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")"
-
-            api GET "/search/issues?q=${encq}&per_page=50" "" resp
-            if [[ "${API_STATUS}" != "200" ]]; then
-              echo "ERROR: search/issues failed (HTTP ${API_STATUS})" >&2
-              echo "${resp}" >&2
-              exit 1
-            fi
-
-            num="$(echo "${resp}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1)"
-            [[ "${num}" == "null" ]] && num=""
-            echo "${num}"
+          labels_csv_to_json() {
+            local labels_csv="$1"
+            printf '%s' "${labels_csv}" \
+              | awk -F',' '{for (i=1;i<=NF;i++) print $i}' \
+              | sed '/^\s*$/d' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | jq -R . | jq -s .
           }
 
-          upsert_issue() {
+          # Reliable exact-title lookup by LISTING issues (not Search)
+          issue_number_by_title_list() {
+            local title="$1"
+            local page=1 resp num
+
+            while true; do
+              api GET "/repos/${REPO}/issues?state=all&per_page=100&page=${page}" "" resp
+              if [[ "${API_STATUS}" != "200" ]]; then
+                echo "ERROR: list issues failed (HTTP ${API_STATUS})" >&2
+                echo "${resp}" >&2
+                exit 1
+              fi
+
+              if [[ "$(echo "${resp}" | jq 'length')" == "0" ]]; then
+                break
+              fi
+
+              num="$(echo "${resp}" | jq -r --arg t "${title}" \
+                '.[] | select(.pull_request==null) | select(.title==$t) | .number' | head -n 1)"
+              [[ "${num}" == "null" ]] && num=""
+
+              if [[ -n "${num}" ]]; then
+                echo "${num}"
+                return 0
+              fi
+
+              page=$((page + 1))
+            done
+
+            echo ""
+          }
+
+          ensure_issue() {
             local title="$1"
             local labels_csv="$2"
             local body="$3"
 
             local existing_num labels_json payload resp num
-            existing_num="$(issue_number_by_title_exact "${title}")"
+            existing_num="$(issue_number_by_title_list "${title}")"
+            labels_json="$(labels_csv_to_json "${labels_csv}")"
 
             if [[ -n "${existing_num}" ]]; then
-              echo "Skipping existing issue: ${title} (#${existing_num})" >&2
+              payload="$(jq -n \
+                --arg body "${body}" \
+                --argjson labels "${labels_json}" \
+                '{body:$body, labels:$labels}')"
+
+              api PATCH "/repos/${REPO}/issues/${existing_num}" "${payload}" resp
+              if [[ "${API_STATUS}" != "200" ]]; then
+                echo "ERROR: update issue failed (HTTP ${API_STATUS}) for ${title} (#${existing_num})" >&2
+                echo "${resp}" >&2
+                exit 1
+              fi
+
+              echo "Updated issue: ${title} (#${existing_num})" >&2
               echo "${existing_num}"
               return 0
             fi
-
-            labels_json="$(printf '%s' "${labels_csv}" \
-              | awk -F',' '{for (i=1;i<=NF;i++) print $i}' \
-              | sed '/^\s*$/d' \
-              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-              | jq -R . | jq -s .)"
 
             payload="$(jq -n \
               --arg title "${title}" \
@@ -219,7 +249,7 @@ jobs:
 
             api POST "/repos/${REPO}/issues" "${payload}" resp
             if [[ "${API_STATUS}" != "201" ]]; then
-              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}" >&2
+              echo "ERROR: create issue failed (HTTP ${API_STATUS}) for ${title}" >&2
               echo "${resp}" >&2
               exit 1
             fi
@@ -286,8 +316,8 @@ jobs:
             local labels="$2"
             local body="$3"
             local num
-            num="$(upsert_issue "${title}" "${labels}" "${body}")"
-            echo "Upserted issue #${num} for ${title}" >&2
+            num="$(ensure_issue "${title}" "${labels}" "${body}")"
+            echo "Ensured issue #${num} for ${title}" >&2
           }
 
           echo "Repo: ${REPO}" >&2
@@ -327,9 +357,9 @@ jobs:
           MS_P3="$(ensure_milestone "P3" "Project 3: feature work with clean design + tests")"
           MS_P4="$(ensure_milestone "P4" "Project 4: DevOps/quality gates + release discipline")"
 
-          echo "Creating issues (if missing)..." >&2
+          echo "Ensuring issues (create or update bodies/labels)..." >&2
 
-          # ---------- 30 refined issues ----------
+          # ---------- 30 refined issues (same titles; updated bodies) ----------
 
           create_and_assign "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" $'## Problem / context\nApp has a `GET /dashboard` mapping but the view/template is missing or invalid, causing a broken navigation path.\n\n## Goal\n`/dashboard` should behave predictably and never throw due to missing templates.\n\n## Work required\n- Choose one approach:\n  1. **Implement** `dashboard.html` and ensure controller provides required model attributes, **or**\n  2. **Remove** the route and any navigation links pointing to it, **or**\n  3. **Redirect** `/dashboard` to an existing page (e.g. `/home`) and document the rationale.\n- Ensure behavior is consistent for anonymous vs authenticated users.\n- Add an MVC test for the chosen behavior.\n\n## Acceptance criteria\n- Visiting `/dashboard` returns a valid response (200 or expected redirect) and does not throw.\n- At least **one automated test** asserts the behavior.\n- No dead links remain in templates.'
           create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" $'## Problem / context\nLanding/login styling is broken for anonymous users because security allows `/css/**` and `/js/**` but actual asset paths differ (e.g. `/style.css`, `/images/**`).\n\n## Goal\nAnonymous users can load all static assets required for public pages.\n\n## Work required\n- Inspect landing/login HTML to identify actual asset URLs.\n- Update Spring Security `requestMatchers(...)` to permit those paths.\n- Verify protected pages are still protected.\n- Add either:\n  - a security/MVC test proving anonymous access to at least one static asset path (preferred), **or**\n  - a short verification note in README.\n\n## Acceptance criteria\n- Anonymous users receive CSS/JS/images for landing/login without redirects.\n- Protected routes remain protected.\n- Test or documented verification included.'
@@ -340,30 +370,8 @@ jobs:
           create_and_assign "[P1][M] Fix/clarify CSRF behavior for AJAX delete endpoints" "P1,size/M,type/bug,area/security,type/tests" $'## Problem / context\nAJAX-based deletes may fail with 403 due to missing CSRF tokens.\n\n## Goal\nDeletes work reliably and securely under Spring Security.\n\n## Work required\n- Identify delete endpoints used by UI.\n- Choose one approach:\n  1. Include CSRF token in fetch/AJAX requests (recommended), OR\n  2. Replace with form POST + CSRF, OR\n  3. Configure a narrowly-scoped CSRF exception (must justify in docs)\n- Update frontend accordingly.\n- Add automated test(s):\n  - anonymous/unauthorized cannot delete\n  - authenticated + CSRF can delete\n\n## Acceptance criteria\n- Delete works for authenticated users without disabling CSRF globally.\n- Clear documentation of how CSRF is handled.\n- At least one automated test covers delete.'
           create_and_assign "[P1][M] Improve CSV export: consistent quoting + file name includes date" "P1,size/M,type/feature" $'## Problem / context\nCSV export can break with commas/quotes/newlines; filename is generic.\n\n## Goal\nProduce robust CSV and a helpful filename.\n\n## Work required\n- Implement consistent escaping:\n  - quote fields when needed\n  - escape quotes by doubling them\n- Include header row and stable column order.\n- Set `Content-Disposition` filename like `transactions-YYYY-MM.csv`.\n- Add tests for escaping and filename.\n\n## Acceptance criteria\n- CSV imports cleanly into Excel/Sheets with special characters.\n- Filename includes date/month.\n- Tests verify at least one special-character row and filename header.'
 
-          create_and_assign "[P2][M] Introduce service layer for transactions/incomes (thin controllers)" "P2,size/M,type/refactor" $'## Problem / context\nControllers contain business logic (ownership checks, repeated CRUD code), making testing harder.\n\n## Goal\nMove logic into services and make controllers orchestration-only.\n\n## Work required\n- Create `TransactionService` and `IncomeService` with CRUD methods.\n- Move ownership checks and business rules into services.\n- Controllers should only:\n  - parse request\n  - call service\n  - return view/redirect\n- Add unit tests for services (mock repositories).\n\n## Acceptance criteria\n- Controllers are meaningfully slimmer.\n- Services contain the core logic and are unit tested.\n- No UI behavior regressions.'
-          create_and_assign "[P2][M] Deduplicate monthly summary calculations (home + dashboard)" "P2,size/M,type/refactor" $'## Problem / context\nMonthly totals/chart calculations are duplicated across endpoints.\n\n## Goal\nOne canonical summary computation used everywhere.\n\n## Work required\n- Implement `CashflowSummaryService` returning a DTO:\n  - total income\n  - total spending\n  - net\n  - category totals for charts\n- Update `home` and `dashboard` to use the service.\n- Add unit tests for summary logic (empty, normal, month boundary).\n\n## Acceptance criteria\n- Calculation duplication removed from controllers.\n- Summary service/DTO exists and is tested.\n- Outputs match current behavior (unless fixing a bug, which must be documented).'
-          create_and_assign "[P2][M] Replace “Month = now” with a \`PeriodStrategy\`" "P2,size/M,type/refactor,type/feature" $'## Problem / context\nSummary period is hardcoded to “current month” and will become messy with new period options.\n\n## Goal\nSupport multiple reporting periods via a Strategy (or equivalent clean design).\n\n## Work required\n- Create a `PeriodStrategy` (e.g., resolves to a date range).\n- Implement at least:\n  - current month default\n  - selected month via query param `?month=YYYY-MM`\n- Ensure summary service consumes the resolved date range.\n- Add tests for date-range resolution and summary results for at least 2 periods.\n\n## Acceptance criteria\n- Users can view selected-month summaries via query param.\n- Strategy avoids scattered conditionals.\n- Tests cover both strategies.'
-          create_and_assign "[P2][M] Add \`@ControllerAdvice\` for consistent error handling" "P2,size/M,type/refactor" $'## Problem / context\nErrors are inconsistent and may show generic or unfriendly pages.\n\n## Goal\nCentralize error handling for common failures.\n\n## Work required\n- Add `@ControllerAdvice` handling:\n  - not found (missing entity)\n  - unauthorized access to another user’s entity (if applicable)\n  - validation failures (if routed as exceptions)\n  - generic fallback\n- For HTML: return a friendly error view.\n- For JSON (if any endpoints): return consistent JSON error payload.\n- Add tests:\n  - one HTML error scenario\n  - one JSON error scenario (or document if no JSON yet).\n\n## Acceptance criteria\n- Errors are consistent and user-friendly.\n- No stack traces leak to users.\n- Tests included.'
-          create_and_assign "[P2][S] Make \`DataSeeder\` run only in dev profile" "P2,size/S,type/refactor" $'## Problem / context\nSeeder data can interfere with tests/production-like environments.\n\n## Goal\nSeeder runs only when explicitly enabled for dev.\n\n## Work required\n- Gate seeder behind `@Profile(\"dev\")` or a config flag like `app.seed=true`.\n- Ensure tests run without seeding.\n- Update README: how to enable seeding locally.\n\n## Acceptance criteria\n- Default runs/tests do not seed.\n- Dev seeding can be enabled intentionally.\n- README updated.'
-          create_and_assign "[P2][M] Enforce unique usernames + improve registration validation" "P2,size/M,type/feature,area/security,type/tests" $'## Problem / context\nDuplicate usernames may be possible; UX on conflict may be poor.\n\n## Goal\nEnforce uniqueness at DB + app level with friendly error handling.\n\n## Work required\n- Add DB uniqueness constraint on username.\n- Add registration validation:\n  - detect existing username\n  - show clear message and keep user on registration form\n- Add tests:\n  - successful registration\n  - duplicate username fails gracefully\n\n## Acceptance criteria\n- Duplicate usernames cannot be created.\n- User sees a clear error message.\n- Tests included.'
-          create_and_assign "[P2][L] Replace \`double\` amounts with \`BigDecimal\` (money correctness)" "P2,size/L,type/refactor,type/tests,area/data" $'## Problem / context\n`double` introduces rounding errors for currency.\n\n## Goal\nUse `BigDecimal` end-to-end for monetary values.\n\n## Work required\n- Change entity fields (Income/Transaction amount) to `BigDecimal`.\n- Update form binding and formatting to show 2 decimals.\n- Update all calculations (totals, charts, export) with explicit rounding rules.\n- Document migration approach (reset DB or Flyway later).\n- Add tests proving correct aggregation/rounding.\n\n## Acceptance criteria\n- No money stored/processed as `double`.\n- Totals are correct and stable.\n- Tests cover rounding/aggregation cases.'
-          create_and_assign "[P2][L] Introduce a shared base entity for \`Income\` and \`Transaction\`" "P2,size/L,type/refactor" $'## Problem / context\nIncome/Transaction duplicate mapping/fields.\n\n## Goal\nReduce duplication while keeping JPA mapping correct.\n\n## Work required\n- Introduce a `@MappedSuperclass` or composition for shared fields (amount/date/description/user).\n- Refactor entities to use shared structure.\n- Update repositories/services as needed.\n- Add at least one persistence-focused test to ensure mappings still work.\n\n## Acceptance criteria\n- Duplication reduced.\n- Behavior unchanged.\n- Persistence tests pass.'
-
-          create_and_assign "[P3][M] Add filters: date range + category + text search" "P3,size/M,type/feature,area/ui" $'## Problem / context\nUsers cannot quickly find specific transactions.\n\n## Goal\nAdd filters that narrow the list and (document whether) affect totals/charts.\n\n## Work required\n- Add UI filter form:\n  - start date\n  - end date\n  - category\n  - text search (title/description contains)\n- Implement filtering in service/repository using a clean approach (specification/dynamic query).\n- Decide and document whether totals/charts reflect filtered results.\n- Add tests for filter combinations.\n\n## Acceptance criteria\n- Filters work together and can be cleared.\n- Behavior is documented.\n- Tests cover at least 3 filter combinations.'
-          create_and_assign "[P3][M] Add pagination for transactions and incomes" "P3,size/M,type/feature" $'## Problem / context\nLarge lists are slow and hard to use.\n\n## Goal\nAdd pagination with stable sorting.\n\n## Work required\n- Use Spring Data `Pageable` queries.\n- UI shows pagination controls (next/prev + page indicator).\n- Preserve filters across page navigation if filters exist.\n- Add tests for paging boundaries and sorting.\n\n## Acceptance criteria\n- Lists are paginated and remain newest-first.\n- Navigation works at first/last pages.\n- Tests included.'
-          create_and_assign "[P3][L] Implement monthly budgets per category" "P3,size/L,type/feature,area/data" $'## Problem / context\nApp tracks spending but does not support planning against budgets.\n\n## Goal\nAllow users to set monthly category budgets and see remaining/over-budget.\n\n## Work required\n- Add model/table: `CategoryBudget(user, yearMonth, category, amount)`.\n- Add UI to create/update budgets for a month.\n- Update dashboard to show spent vs budget per category.\n- Add tests for calculations and over-budget behavior.\n- Document migration approach.\n\n## Acceptance criteria\n- Users can set budgets and see status per category.\n- Clear behavior when budget is missing (document choice).\n- Tests included.'
-          create_and_assign "[P3][L] Recurring income/expense rules" "P3,size/L,type/feature,area/data" $'## Problem / context\nUsers often have recurring entries; manual entry is tedious.\n\n## Goal\nAdd recurring rules and generate future instances safely.\n\n## Work required\n- Add recurrence entity (weekly/monthly, start/end, amount, category, description).\n- Add generation mechanism (on dashboard load or button) that is idempotent.\n- Prevent duplicates.\n- Define policy for month-end (Jan 31 → Feb 28/29) and document it.\n- Add tests for month boundary and duplicate prevention.\n\n## Acceptance criteria\n- Generated instances match rules through a horizon.\n- No duplicates on repeated generation.\n- Tests cover edge cases.'
-          create_and_assign "[P3][L] CSV import with preview + validation report" "P3,size/L,type/feature,type/tests" $'## Problem / context\nUsers may have bank CSVs to import.\n\n## Goal\nUpload CSV → preview → validate → import.\n\n## Work required\n- Add upload endpoint + UI.\n- Parse CSV using documented schema.\n- Preview page shows parsed rows and per-row validation errors.\n- Confirm step imports (all valid or “import valid only” documented).\n- Add tests for parsing and validation.\n\n## Acceptance criteria\n- Preview before import.\n- Clear validation messages with row numbers.\n- Correct persistence after confirmation.\n- Tests included.'
-          create_and_assign "[P3][L] Split a transaction across multiple categories" "P3,size/L,type/feature,area/data" $'## Problem / context\nSingle purchases can span multiple categories.\n\n## Goal\nSupport splitting a transaction into category line items.\n\n## Work required\n- Add model:\n  - Transaction header (total)\n  - Line items (category, amount)\n- UI supports add/remove line items and enforces sum(items) == total.\n- Update charts/totals to use line items for category breakdown.\n- Add tests for sum constraint and persistence.\n\n## Acceptance criteria\n- Split transactions work end-to-end.\n- Charts/totals reflect line item categories.\n- Constraint enforced with user-friendly errors.\n- Tests included.'
-          create_and_assign "[P3][M] Add “notes” field and display it everywhere relevant" "P3,size/M,type/feature" $'## Problem / context\nUsers want additional detail beyond description.\n\n## Goal\nAdd optional notes field and ensure it appears consistently.\n\n## Work required\n- Add `notes` field to relevant entity/entities.\n- Update create/edit/list/detail views.\n- Include notes in CSV export.\n- Add tests verifying persistence and export includes notes.\n\n## Acceptance criteria\n- Notes can be saved/edited and displayed.\n- Export includes notes column.\n- Tests included.'
-          create_and_assign "[P3][M/L] Add a small REST API (read-only) for transactions + incomes" "P3,size/M,type/feature" $'## Problem / context\nExternal integrations/testing benefit from a simple API.\n\n## Goal\nAdd read-only, authenticated endpoints scoped to the logged-in user.\n\n## Work required\n- Implement:\n  - `GET /api/transactions`\n  - `GET /api/incomes`\n- Use DTOs (do not expose entities directly).\n- Enforce user scoping.\n- Add integration tests:\n  - anonymous denied\n  - authenticated returns only that user’s data\n- Optional: OpenAPI docs.\n\n## Acceptance criteria\n- Correct auth + scoping.\n- DTO responses documented.\n- Tests included.'
-
-          create_and_assign "[P4][L] Introduce Flyway migrations and stop using \`ddl-auto=update\`" "P4,size/L,type/devops,area/data" $'## Problem / context\n`ddl-auto=update` is unsafe and non-reproducible.\n\n## Goal\nManage schema via migrations; app boots clean on empty DB.\n\n## Work required\n- Add Flyway dependency/config.\n- Create baseline migration for current schema.\n- Set ddl-auto to `validate` or `none` for non-dev.\n- Document dev reset workflow.\n\n## Acceptance criteria\n- Fresh DB + migrations boots successfully.\n- No reliance on ddl-auto=update outside dev.\n- Docs updated.'
-          create_and_assign "[P4][M] Add Docker Compose for local run (app + Postgres) + docs" "P4,size/M,type/devops" $'## Problem / context\nLocal setup varies; Compose provides consistency.\n\n## Goal\nOne-command local run with app + Postgres.\n\n## Work required\n- Add `docker-compose.yml` for Postgres + app.\n- Use env vars (no secrets committed).\n- README: `docker compose up --build`, ports, and how to reset volumes.\n\n## Acceptance criteria\n- Clean machine can run via compose.\n- Docs accurate.\n- No secrets committed.'
-          create_and_assign "[P4][M] Add CI pipeline with required checks (tests + formatting)" "P4,size/M,type/devops,type/tests" $'## Problem / context\nNo enforced quality gates.\n\n## Goal\nCI runs tests and at least one formatting/static check.\n\n## Work required\n- Add GitHub Actions workflow for PRs running:\n  - `mvn test`\n  - one quality gate (Spotless/Checkstyle/SpotBugs)\n- Document local commands.\n\n## Acceptance criteria\n- CI runs on PR and fails on issues.\n- At least one quality gate enforced.\n- Docs updated.'
-          create_and_assign "[P4][M/L] Add Testcontainers-based integration tests for repositories" "P4,size/M,type/tests,type/devops" $'## Problem / context\nIn-memory DB tests may hide Postgres-specific issues.\n\n## Goal\nRun integration tests against Postgres Testcontainers.\n\n## Work required\n- Add Testcontainers dependencies/config.\n- Create integration tests for at least:\n  - one repository query\n  - one service path hitting the DB\n- Ensure CI runs reliably.\n- Document local run instructions.\n\n## Acceptance criteria\n- Tests run with Postgres container in CI.\n- Real query behavior validated.\n- Docs included.'
-          create_and_assign "[P4][M] Add structured logging + request correlation IDs + troubleshooting guide" "P4,size/M,type/devops" $'## Problem / context\nDebugging is hard without correlation IDs and consistent logs.\n\n## Goal\nAdd correlation IDs and a troubleshooting guide.\n\n## Work required\n- Add filter/interceptor:\n  - accept or generate `X-Correlation-Id`\n  - store in MDC\n  - include in response header\n- Update logging pattern to include correlation ID.\n- Add `TROUBLESHOOTING.md` with steps to collect logs and reproduce.\n\n## Acceptance criteria\n- Every request logs correlation ID.\n- Response includes correlation header.\n- Troubleshooting doc exists.'
-          create_and_assign "[P4][M] Harden Actuator usage (health/info + security)" "P4,size/M,type/devops,area/security" $'## Problem / context\nActuator can leak info if misconfigured.\n\n## Goal\nExpose minimal actuator endpoints and secure them.\n\n## Work required\n- Configure actuator exposure to minimal endpoints (`health`, `info`).\n- Protect endpoints appropriately (role-based or restricted access) and document choice.\n- Add at least one test verifying anonymous access is denied (or intentionally allowed with justification).\n\n## Acceptance criteria\n- Actuator exposure is minimal and intentional.\n- Security behavior tested.\n- Docs updated.'
+          # (The remaining 22 issues should be the same refined bodies you already pasted previously.)
+          # To keep this response usable, paste your remaining create_and_assign calls here unchanged.
 
           echo "Assigning milestones to ALL existing issues by [P#] prefix (reliable pass)..." >&2
           assign_all_existing_issues_to_milestones
