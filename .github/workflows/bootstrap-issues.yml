@@ -26,16 +26,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          api_json() {
+          # Global-ish status holder (always initialized so -u won't blow up)
+          API_STATUS=""
+
+          api() {
+            # Usage: api METHOD PATH [DATA] OUTVAR
             local method="$1"
             local path="$2"
             local data="${3:-}"
+            local outvar="$4"
+
             local url="https://api.github.com${path}"
-            local resp_file
-            resp_file="$(mktemp)"
+            local tmp
+            tmp="$(mktemp)"
 
             if [[ -n "${data}" ]]; then
-              API_STATUS="$(curl -sS -o "${resp_file}" -w "%{http_code}" \
+              API_STATUS="$(curl -sS -o "${tmp}" -w "%{http_code}" \
                 -X "${method}" \
                 -H "Accept: application/vnd.github+json" \
                 -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -43,7 +49,7 @@ jobs:
                 "${url}" \
                 -d "${data}")"
             else
-              API_STATUS="$(curl -sS -o "${resp_file}" -w "%{http_code}" \
+              API_STATUS="$(curl -sS -o "${tmp}" -w "%{http_code}" \
                 -X "${method}" \
                 -H "Accept: application/vnd.github+json" \
                 -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -51,51 +57,51 @@ jobs:
                 "${url}")"
             fi
 
-            cat "${resp_file}"
-            rm -f "${resp_file}"
+            # Assign body to caller variable in THIS shell
+            printf -v "${outvar}" '%s' "$(cat "${tmp}")"
+            rm -f "${tmp}"
           }
 
           urlencode() {
             python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
           }
 
-          # ----- Existence checks (for the guard) -----
+          # ----- Guard helpers -----
 
           any_issues_exist() {
-            # Counts issues (open + closed), excludes PRs.
-            local q encq results total
+            local q encq resp total
             q="repo:${REPO} is:issue"
             encq="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")"
 
-            results="$(api_json GET "/search/issues?q=${encq}&per_page=1")"
+            api GET "/search/issues?q=${encq}&per_page=1" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: search/issues failed (HTTP ${API_STATUS})"
-              echo "${results}"
+              echo "${resp}"
               exit 1
             fi
 
-            total="$(echo "${results}" | jq -r '.total_count')"
+            total="$(echo "${resp}" | jq -r '.total_count')"
             [[ "${total}" != "0" ]]
           }
 
           any_milestones_exist() {
-            local data
-            data="$(api_json GET "/repos/${REPO}/milestones?state=all&per_page=1")"
+            local resp
+            api GET "/repos/${REPO}/milestones?state=all&per_page=1" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: milestones list failed (HTTP ${API_STATUS})"
-              echo "${data}"
+              echo "${resp}"
               exit 1
             fi
-            [[ "$(echo "${data}" | jq 'length')" != "0" ]]
+            [[ "$(echo "${resp}" | jq 'length')" != "0" ]]
           }
 
           # ----- Labels -----
 
           label_exists() {
             local name="$1"
-            local enc
+            local enc resp
             enc="$(urlencode "$name")"
-            api_json GET "/repos/${REPO}/labels/${enc}" >/dev/null
+            api GET "/repos/${REPO}/labels/${enc}" "" resp
             [[ "${API_STATUS}" == "200" ]]
           }
 
@@ -103,25 +109,25 @@ jobs:
             local name="$1"
             local color="$2"
             local desc="$3"
-            local enc
+            local enc resp payload patch
+
             enc="$(urlencode "$name")"
 
-            local payload
             payload="$(jq -n --arg name "$name" --arg color "$color" --arg description "$desc" \
               '{name:$name,color:$color,description:$description}')"
 
-            api_json POST "/repos/${REPO}/labels" "${payload}" >/dev/null
+            api POST "/repos/${REPO}/labels" "${payload}" resp
+
             if [[ "${API_STATUS}" == "201" ]]; then
               echo "Created label: ${name}"
               return 0
             fi
 
-            # 422 = already exists (or validation)
             if [[ "${API_STATUS}" == "422" ]]; then
-              local patch
               patch="$(jq -n --arg new_name "$name" --arg color "$color" --arg description "$desc" \
                 '{new_name:$new_name,color:$color,description:$description}')"
-              api_json PATCH "/repos/${REPO}/labels/${enc}" "${patch}" >/dev/null
+
+              api PATCH "/repos/${REPO}/labels/${enc}" "${patch}" resp
               if [[ "${API_STATUS}" == "200" ]]; then
                 echo "Updated label: ${name}"
                 return 0
@@ -129,6 +135,7 @@ jobs:
             fi
 
             echo "ERROR: ensure_label failed for ${name} (HTTP ${API_STATUS})"
+            echo "${resp}"
             exit 1
           }
 
@@ -136,41 +143,40 @@ jobs:
 
           milestone_number_by_title() {
             local title="$1"
-            local data
-            # IMPORTANT: state=all so we find closed milestones too
-            data="$(api_json GET "/repos/${REPO}/milestones?state=all&per_page=100")"
+            local resp num
+            api GET "/repos/${REPO}/milestones?state=all&per_page=100" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: milestones list failed (HTTP ${API_STATUS})"
-              echo "${data}"
+              echo "${resp}"
               exit 1
             fi
-            echo "${data}" | jq -r --arg t "${title}" '.[] | select(.title==$t) | .number' | head -n 1
+            num="$(echo "${resp}" | jq -r --arg t "${title}" '.[] | select(.title==$t) | .number' | head -n 1)"
+            [[ "${num}" == "null" ]] && num=""
+            echo "${num}"
           }
 
           ensure_milestone() {
             local title="$1"
             local description="$2"
-            local existing
-            existing="$(milestone_number_by_title "${title}")"
+            local existing payload resp num
 
-            if [[ -n "${existing}" && "${existing}" != "null" ]]; then
+            existing="$(milestone_number_by_title "${title}")"
+            if [[ -n "${existing}" ]]; then
               echo "Milestone exists: ${title} (#${existing})" >&2
               echo "${existing}"
               return 0
             fi
 
-            local payload
             payload="$(jq -n --arg title "$title" --arg description "$description" \
               '{title:$title, description:$description}')"
 
-            local resp
-            resp="$(api_json POST "/repos/${REPO}/milestones" "${payload}")"
+            api POST "/repos/${REPO}/milestones" "${payload}" resp
             if [[ "${API_STATUS}" != "201" ]]; then
               echo "ERROR: create milestone failed for ${title} (HTTP ${API_STATUS})"
               echo "${resp}"
               exit 1
             fi
-            local num
+
             num="$(echo "${resp}" | jq -r '.number')"
             echo "Created milestone: ${title} (#${num})" >&2
             echo "${num}"
@@ -178,33 +184,69 @@ jobs:
 
           # ----- Issues -----
 
-          # Returns issue number if found by exact title; blank if not found.
           issue_number_by_title_exact() {
             local title="$1"
-            local q="repo:${REPO} is:issue in:title \"${title}\""
-            local encq
+            local q encq resp num
+            q="repo:${REPO} is:issue in:title \"${title}\""
             encq="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")"
 
-            local results
-            results="$(api_json GET "/search/issues?q=${encq}&per_page=50")"
+            api GET "/search/issues?q=${encq}&per_page=50" "" resp
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: search/issues failed (HTTP ${API_STATUS})"
-              echo "${results}"
+              echo "${resp}"
               exit 1
             fi
 
-            # Ensure it's not a PR and title is exact.
-            echo "${results}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1
+            num="$(echo "${resp}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1)"
+            [[ "${num}" == "null" ]] && num=""
+            echo "${num}"
+          }
+
+          upsert_issue() {
+            local title="$1"
+            local labels_csv="$2"
+            local body="$3"
+
+            local existing_num labels_json payload resp num
+            existing_num="$(issue_number_by_title_exact "${title}")"
+
+            if [[ -n "${existing_num}" ]]; then
+              echo "Skipping existing issue: ${title} (#${existing_num})"
+              echo "${existing_num}"
+              return 0
+            fi
+
+            labels_json="$(printf '%s' "${labels_csv}" \
+              | awk -F',' '{for (i=1;i<=NF;i++) print $i}' \
+              | sed '/^\s*$/d' \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+              | jq -R . | jq -s .)"
+
+            payload="$(jq -n \
+              --arg title "${title}" \
+              --arg body "${body}" \
+              --argjson labels "${labels_json}" \
+              '{title:$title, body:$body, labels:$labels}')"
+
+            api POST "/repos/${REPO}/issues" "${payload}" resp
+            if [[ "${API_STATUS}" != "201" ]]; then
+              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}"
+              echo "${resp}"
+              exit 1
+            fi
+
+            num="$(echo "${resp}" | jq -r '.number')"
+            echo "Created issue: ${title} (#${num})"
+            echo "${num}"
           }
 
           assign_issue_to_milestone() {
             local issue_number="$1"
             local milestone_number="$2"
-            local payload
+            local payload resp
             payload="$(jq -n --argjson milestone "$milestone_number" '{milestone:$milestone}')"
 
-            local resp
-            resp="$(api_json PATCH "/repos/${REPO}/issues/${issue_number}" "${payload}")"
+            api PATCH "/repos/${REPO}/issues/${issue_number}" "${payload}" resp
             if [[ "${API_STATUS}" != "200" ]]; then
               echo "ERROR: assign milestone failed for issue #${issue_number} (HTTP ${API_STATUS})"
               echo "${resp}"
@@ -223,52 +265,24 @@ jobs:
             esac
           }
 
-          # Creates issue if missing; returns issue number (existing or newly created).
-          upsert_issue() {
+          create_and_assign() {
             local title="$1"
-            local labels_csv="$2"
+            local labels="$2"
             local body="$3"
+            local num ms
 
-            local existing_num
-            existing_num="$(issue_number_by_title_exact "${title}")"
-            if [[ -n "${existing_num}" && "${existing_num}" != "null" ]]; then
-              echo "Skipping existing issue: ${title} (#${existing_num})"
-              echo "${existing_num}"
-              return 0
+            num="$(upsert_issue "${title}" "${labels}" "${body}")"
+            ms="$(milestone_for_title "${title}")"
+            if [[ -n "${ms}" ]]; then
+              assign_issue_to_milestone "${num}" "${ms}"
+              echo "Assigned issue #${num} -> milestone #${ms}"
             fi
-
-            local labels_json
-            labels_json="$(printf '%s' "${labels_csv}" \
-              | awk -F',' '{for (i=1;i<=NF;i++) print $i}' \
-              | sed '/^\s*$/d' \
-              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-              | jq -R . | jq -s .)"
-
-            local payload
-            payload="$(jq -n \
-              --arg title "${title}" \
-              --arg body "${body}" \
-              --argjson labels "${labels_json}" \
-              '{title:$title, body:$body, labels:$labels}')"
-
-            local resp
-            resp="$(api_json POST "/repos/${REPO}/issues" "${payload}")"
-            if [[ "${API_STATUS}" != "201" ]]; then
-              echo "ERROR: create_issue failed (HTTP ${API_STATUS}) for ${title}"
-              echo "${resp}"
-              exit 1
-            fi
-
-            local num
-            num="$(echo "${resp}" | jq -r '.number')"
-            echo "Created issue: ${title} (#${num})"
-            echo "${num}"
           }
 
           echo "Repo: ${REPO}"
           echo "Force: ${FORCE}"
 
-          # Guard: SKIP only if BOTH issues exist AND milestones exist (unless forced).
+          # Skip ONLY if BOTH issues exist AND milestones exist (unless forced).
           if [[ "${FORCE}" != "true" ]]; then
             if any_issues_exist && any_milestones_exist; then
               echo "Repo already has issues AND milestones; skipping bootstrap."
@@ -303,21 +317,6 @@ jobs:
           MS_P4="$(ensure_milestone "P4" "Project 4: DevOps/quality gates + release discipline")"
 
           echo "Creating issues and assigning milestones..."
-
-          create_and_assign() {
-            local title="$1"
-            local labels="$2"
-            local body="$3"
-            local num
-            num="$(upsert_issue "${title}" "${labels}" "${body}")"
-            local ms
-            ms="$(milestone_for_title "${title}")"
-            if [[ -n "${ms}" ]]; then
-              assign_issue_to_milestone "${num}" "${ms}"
-              echo "Assigned issue #${num} -> milestone #${ms}"
-            fi
-          }
-
           create_and_assign "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" $'Problem: Controller has `@GetMapping("/dashboard")` but no `dashboard.html` template.\n\nAcceptance criteria\n- Visiting `/dashboard` while logged in returns a valid page (either create `dashboard.html` or remove/redirect route).\n- Add at least one MVC test proving the behavior.\n\nNotes\n- If you keep it: reuse model attributes already computed in controller.'
           create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,area/security" $'Problem: Security config permits `/css/**` and `/js/**`, but the repo uses `src/main/resources/static/style.css` (served at `/style.css`).\n\nAcceptance criteria\n- Landing + login pages load CSS without authentication.\n- Add a test (or document manual verification) showing unauthenticated access to the CSS path.\n\nHint\n- Update `requestMatchers(...)` to permit the actual static paths used.'
           create_and_assign "[P1][S] Sort transactions and incomes by date (newest first)" "P1,size/S,type/refactor" $'Acceptance criteria\n- Home page shows newest-first ordering for both transactions and incomes.\n- Use repository methods (e.g., `findByUserIdOrderByDateDesc`) instead of sorting in the view.\n- Add a unit test or repository test for ordering.'
