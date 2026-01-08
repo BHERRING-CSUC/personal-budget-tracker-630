@@ -26,10 +26,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Always initialized so `set -u` won't fail
           API_STATUS=""
 
-          # API helper: keeps API_STATUS in this shell (no subshell capture issues)
           # Usage: api METHOD PATH DATA OUTVAR
           api() {
             local method="$1"
@@ -175,6 +173,7 @@ jobs:
 
           # ---------- Issues ----------
 
+          # Search-based exact title lookup (used for upsert only; may be eventually consistent)
           issue_number_by_title_exact() {
             local title="$1"
             local q encq resp num
@@ -188,7 +187,6 @@ jobs:
               exit 1
             fi
 
-            # exact title + not a PR
             num="$(echo "${resp}" | jq -r --arg t "${title}" '.items[] | select(.title==$t) | select(.pull_request==null) | .number' | head -n 1)"
             [[ "${num}" == "null" ]] && num=""
             echo "${num}"
@@ -247,32 +245,54 @@ jobs:
             fi
           }
 
-          # IMPORTANT: match literal "[P1]" etc. (square brackets are special in globs)
-          milestone_for_title() {
-            local title="$1"
-            case "$title" in
-              "[[]P1[]]"*) echo "${MS_P1}" ;;
-              "[[]P2[]]"*) echo "${MS_P2}" ;;
-              "[[]P3[]]"*) echo "${MS_P3}" ;;
-              "[[]P4[]]"*) echo "${MS_P4}" ;;
-              *) echo "" ;;
-            esac
+          # IMPORTANT: list issues via /issues API (not search) and assign by prefix.
+          # This is the reliable "fix everything" assignment pass.
+          assign_all_existing_issues_to_milestones() {
+            local page=1
+            while true; do
+              local resp
+              api GET "/repos/${REPO}/issues?state=all&per_page=100&page=${page}" "" resp
+              if [[ "${API_STATUS}" != "200" ]]; then
+                echo "ERROR: list issues failed (HTTP ${API_STATUS})" >&2
+                echo "${resp}" >&2
+                exit 1
+              fi
+
+              if [[ "$(echo "${resp}" | jq 'length')" == "0" ]]; then
+                break
+              fi
+
+              echo "${resp}" | jq -r '.[] | select(.pull_request==null) | "\(.number)\t\(.title)"' \
+                | while IFS=$'\t' read -r num title; do
+                    local ms=""
+                    case "${title}" in
+                      "[P1]"*) ms="${MS_P1}" ;;
+                      "[P2]"*) ms="${MS_P2}" ;;
+                      "[P3]"*) ms="${MS_P3}" ;;
+                      "[P4]"*) ms="${MS_P4}" ;;
+                      *) ms="" ;;
+                    esac
+
+                    if [[ -n "${ms}" ]]; then
+                      assign_issue_to_milestone "${num}" "${ms}"
+                      echo "Assigned issue #${num} -> milestone #${ms} (${title})" >&2
+                    fi
+                  done
+
+              page=$((page + 1))
+            done
           }
 
           create_and_assign() {
             local title="$1"
             local labels="$2"
             local body="$3"
-            local num ms
+            local num
 
             num="$(upsert_issue "${title}" "${labels}" "${body}")"
-            ms="$(milestone_for_title "${title}")"
-            if [[ -n "${ms}" ]]; then
-              assign_issue_to_milestone "${num}" "${ms}"
-              echo "Assigned issue #${num} -> milestone #${ms}" >&2
-            else
-              echo "WARN: Could not determine milestone for title: ${title}" >&2
-            fi
+            # Don't rely on title matching here; final assignment pass will handle it.
+            # (Still safe to do nothing here.)
+            echo "Upserted issue #${num} for ${title}" >&2
           }
 
           echo "Repo: ${REPO}" >&2
@@ -312,7 +332,7 @@ jobs:
           MS_P3="$(ensure_milestone "P3" "Project 3: feature work with clean design + tests")"
           MS_P4="$(ensure_milestone "P4" "Project 4: DevOps/quality gates + release discipline")"
 
-          echo "Creating issues and assigning milestones..." >&2
+          echo "Creating issues (if missing)..." >&2
 
           # --- 30 issues ---
           create_and_assign "[P1][S] Fix \`/dashboard\` route (missing view)" "P1,size/S,type/bug,area/ui" $'Problem: Controller has `@GetMapping("/dashboard")` but no `dashboard.html` template.\n\nAcceptance criteria\n- Visiting `/dashboard` while logged in returns a valid page (either create `dashboard.html` or remove/redirect route).\n- Add at least one MVC test proving the behavior.\n\nNotes\n- If you keep it: reuse model attributes already computed in controller.'
@@ -348,5 +368,8 @@ jobs:
           create_and_assign "[P4][M/L] Add Testcontainers-based integration tests for repositories" "P4,size/M,type/tests,type/devops" $'Acceptance criteria\n- Add integration tests that use Postgres Testcontainers for repositories and/or service layer.\n- CI runs them reliably.\n- Document expected runtime and how to run locally.'
           create_and_assign "[P4][M] Add structured logging + request correlation IDs + troubleshooting guide" "P4,size/M,type/devops" $'Acceptance criteria\n- Every request has a correlation ID (filter/interceptor).\n- Logs include safe user identifier, route, and correlation ID.\n- Add TROUBLESHOOTING.md with “how to collect logs and reproduce.”'
           create_and_assign "[P4][M] Harden Actuator usage (health/info + security)" "P4,size/M,type/devops,area/security" $'Acceptance criteria\n- Configure Actuator endpoints (at least health, info) with appropriate exposure.\n- Ensure endpoints are protected (or intentionally exposed with reasoning).\n- Add a custom health indicator for DB connectivity (or verify built-in behavior) and test it.'
+
+          echo "Assigning milestones to ALL existing issues by [P#] prefix (reliable pass)..." >&2
+          assign_all_existing_issues_to_milestones
 
           echo "Done." >&2
