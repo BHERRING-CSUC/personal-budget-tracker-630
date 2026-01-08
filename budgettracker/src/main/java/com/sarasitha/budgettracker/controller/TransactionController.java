@@ -104,7 +104,7 @@ public class TransactionController {
     }
 
     @GetMapping("/delete/{id}")
-    public String deleteTransaction(@PathVariable Long id) {
+    public String deleteTransaction(@PathVariable("id") Long id) {
         Transaction t = transactionRepository.findById(id).orElse(null);
         if (t != null && t.getUser().getId().equals(getLoggedInUser().getId())) {
              transactionRepository.deleteById(id);
@@ -166,7 +166,7 @@ public class TransactionController {
 
     @GetMapping("/transaction/{id}")
     @ResponseBody
-    public ResponseEntity<Transaction> getTransaction(@PathVariable Long id) {
+    public ResponseEntity<Transaction> getTransaction(@PathVariable("id") Long id) {
         return transactionRepository.findById(id)
                 .filter(t -> t.getUser().getId().equals(getLoggedInUser().getId()))
                 .map(ResponseEntity::ok)
@@ -185,7 +185,7 @@ public class TransactionController {
 
     @PostMapping("/transaction/delete/{id}")
     @ResponseBody
-    public ResponseEntity<?> deleteTransactionAjax(@PathVariable Long id) {
+    public ResponseEntity<?> deleteTransactionAjax(@PathVariable("id") Long id) {
         Transaction t = transactionRepository.findById(id).orElse(null);
         if (t != null && t.getUser().getId().equals(getLoggedInUser().getId())) {
             transactionRepository.deleteById(id);
@@ -197,7 +197,7 @@ public class TransactionController {
 
     @GetMapping("/income/{id}")
     @ResponseBody
-    public ResponseEntity<Income> getIncome(@PathVariable Long id) {
+    public ResponseEntity<Income> getIncome(@PathVariable("id") Long id) {
         return incomeRepository.findById(id)
                 .filter(i -> i.getUser().getId().equals(getLoggedInUser().getId()))
                 .map(ResponseEntity::ok)
@@ -216,7 +216,7 @@ public class TransactionController {
 
     @PostMapping("/income/delete/{id}")
     @ResponseBody
-    public ResponseEntity<?> deleteIncomeAjax(@PathVariable Long id) {
+    public ResponseEntity<?> deleteIncomeAjax(@PathVariable("id") Long id) {
         Income i = incomeRepository.findById(id).orElse(null);
         if (i != null && i.getUser().getId().equals(getLoggedInUser().getId())) {
             incomeRepository.deleteById(id);
