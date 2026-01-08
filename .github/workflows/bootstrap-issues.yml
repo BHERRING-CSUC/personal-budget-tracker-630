@@ -247,13 +247,14 @@ jobs:
             fi
           }
 
+          # IMPORTANT: match literal "[P1]" etc. (square brackets are special in globs)
           milestone_for_title() {
             local title="$1"
             case "$title" in
-              "[P1]"*) echo "${MS_P1}" ;;
-              "[P2]"*) echo "${MS_P2}" ;;
-              "[P3]"*) echo "${MS_P3}" ;;
-              "[P4]"*) echo "${MS_P4}" ;;
+              "[[]P1[]]"*) echo "${MS_P1}" ;;
+              "[[]P2[]]"*) echo "${MS_P2}" ;;
+              "[[]P3[]]"*) echo "${MS_P3}" ;;
+              "[[]P4[]]"*) echo "${MS_P4}" ;;
               *) echo "" ;;
             esac
           }
@@ -269,6 +270,8 @@ jobs:
             if [[ -n "${ms}" ]]; then
               assign_issue_to_milestone "${num}" "${ms}"
               echo "Assigned issue #${num} -> milestone #${ms}" >&2
+            else
+              echo "WARN: Could not determine milestone for title: ${title}" >&2
             fi
           }
 
