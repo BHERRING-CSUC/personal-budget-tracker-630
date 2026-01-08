@@ -68,6 +68,11 @@ A modern, mobile-friendly Spring Boot application for tracking personal finances
 - View analytics, category breakdowns, and net cashflow.
 - Export your data as CSV for backup or analysis.
 
+### Test Account
+The application automatically seeds a test user with sample data for quick evaluation:
+- **Username:** `test`
+- **Password:** `test`
+
 ## Contributing
 Contributions are welcome! Please open issues or submit pull requests for improvements and bug fixes.
 
