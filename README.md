@@ -52,16 +52,50 @@ A modern, mobile-friendly Spring Boot application for tracking personal finances
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/yourusername/personal-budget-tracker.git
-   cd personal-budget-tracker/budgettracker
+   cd personal-budget-tracker
    ```
-2. **Configure PostgreSQL:**
-   - Edit `src/main/resources/application.properties` with your DB credentials.
-3. **Build and run:**
+2. **Run the application:**
+   The project includes a helper script that sets up the environment and starts the server using the default H2 database (no external DB setup required).
    ```bash
+   ./start.sh
+   ```
+   Alternatively, you can manually run:
+   ```bash
+   cd budgettracker
    mvn spring-boot:run
    ```
+
+3. **Running Tests:**
+   Use the provided test script to run the full suite:
+   ```bash
+   ./test.sh
+   ```
+
 4. **Access the app:**
    - Open [http://localhost:8080](http://localhost:8080) in your browser.
+
+## Reference Tests (CSCI 630)
+This project includes example implementations for the four required test types found in `com.sarasitha.budgettracker.examples`:
+
+1. **MVC Test (Controller Slice)**
+   - **File:** `ExampleTransactionControllerMvcTest.java`
+   - **Annotations:** `@WebMvcTest`
+   - **Description:** Tests the controller layer in isolation with mocked services and security.
+
+2. **Service Unit Test**
+   - **File:** `ExampleUserServiceTest.java`
+   - **Annotations:** `@ExtendWith(MockitoExtension.class)`
+   - **Description:** Fast unit tests using Mockito without loading the Spring context.
+
+3. **Repository Test (JPA Slice)**
+   - **File:** `ExampleTransactionRepositoryTest.java`
+   - **Annotations:** `@DataJpaTest`
+   - **Description:** Tests database interactions using an in-memory H2 database.
+
+4. **Integration Test**
+   - **File:** `ExampleHomeFlowIntegrationTest.java`
+   - **Annotations:** `@SpringBootTest`, `@AutoConfigureMockMvc`
+   - **Description:** Full stack integration test ensuring components work together.
 
 ## Usage
 - Add transactions and income via the dashboard forms.
