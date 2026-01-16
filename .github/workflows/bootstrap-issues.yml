@@ -9,10 +9,6 @@ on:
         description: "Re-run even if issues/milestones already exist"
         required: false
         default: "false"
-      purge:
-        description: "Close ALL existing issues first (GitHub cannot delete issues; this closes them)."
-        required: false
-        default: "false"
 
 permissions:
   contents: read
@@ -27,7 +23,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           FORCE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.force) || 'false' }}
-          PURGE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.purge) || 'false' }}
         run: |
           set -euo pipefail
 
@@ -69,7 +64,7 @@ jobs:
             python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
           }
 
-          # Skip ONLY if BOTH issues exist AND milestones exist (unless forced/purge)
+          # Skip ONLY if BOTH issues exist AND milestones exist (unless forced)
           any_issues_exist() {
             local q encq resp total
             q="repo:${REPO} is:issue"
@@ -180,42 +175,7 @@ jobs:
               | jq -R . | jq -s .
           }
 
-          # Close ALL issues (cannot delete). Skip PRs.
-          purge_all_issues_close_only() {
-            echo "PURGE enabled: closing ALL existing issues (PRs are skipped). GitHub does not support issue deletion." >&2
-            local page=1 resp
-
-            while true; do
-              api GET "/repos/${REPO}/issues?state=all&per_page=100&page=${page}" "" resp
-              if [[ "${API_STATUS}" != "200" ]]; then
-                echo "ERROR: list issues failed (HTTP ${API_STATUS})" >&2
-                echo "${resp}" >&2
-                exit 1
-              fi
-
-              if [[ "$(echo "${resp}" | jq 'length')" == "0" ]]; then
-                break
-              fi
-
-              echo "${resp}" | jq -r '.[] | select(.pull_request==null) | .number' \
-                | while read -r num; do
-                    local payload out
-                    payload="$(jq -n '{state:"closed", milestone:null, labels:[]}')"
-                    api PATCH "/repos/${REPO}/issues/${num}" "${payload}" out
-                    if [[ "${API_STATUS}" != "200" ]]; then
-                      echo "ERROR: failed to close issue #${num} (HTTP ${API_STATUS})" >&2
-                      echo "${out}" >&2
-                      exit 1
-                    fi
-                  done
-
-              page=$((page + 1))
-            done
-
-            echo "PURGE complete: all issues closed." >&2
-          }
-
-          # Exact-title lookup by listing issues (used only when NOT purging)
+          # Exact-title lookup by listing issues (avoids Search indexing quirks)
           issue_number_by_title_list() {
             local title="$1"
             local page=1 resp num
@@ -247,34 +207,6 @@ jobs:
             echo ""
           }
 
-          # Create a new issue ALWAYS (used when PURGE=true to avoid "updating" closed duplicates)
-          create_issue_always() {
-            local title="$1"
-            local labels_csv="$2"
-            local body="$3"
-            local labels_json payload resp num
-
-            labels_json="$(labels_csv_to_json "${labels_csv}")"
-
-            payload="$(jq -n \
-              --arg title "${title}" \
-              --arg body "${body}" \
-              --argjson labels "${labels_json}" \
-              '{title:$title, body:$body, labels:$labels}')"
-
-            api POST "/repos/${REPO}/issues" "${payload}" resp
-            if [[ "${API_STATUS}" != "201" ]]; then
-              echo "ERROR: create issue failed (HTTP ${API_STATUS}) for ${title}" >&2
-              echo "${resp}" >&2
-              exit 1
-            fi
-
-            num="$(echo "${resp}" | jq -r '.number')"
-            echo "Created issue: ${title} (#${num})" >&2
-            echo "${num}"
-          }
-
-          # Upsert behavior when NOT purging (update existing by title, else create)
           ensure_issue() {
             local title="$1"
             local labels_csv="$2"
@@ -363,6 +295,7 @@ jobs:
 
                     if [[ -n "${ms}" ]]; then
                       assign_issue_to_milestone "${num}" "${ms}"
+                      echo "Assigned issue #${num} -> milestone #${ms} (${title})" >&2
                     fi
                   done
 
@@ -377,27 +310,16 @@ jobs:
             local title="$1"
             local labels="$2"
             local body="$3"
-            local full_body num
+            local full_body
             full_body="${body}"$'\n\n'"${TEST_TYPES}"
-
-            if [[ "${PURGE}" == "true" ]]; then
-              num="$(create_issue_always "${title}" "${labels}" "${full_body}")"
-            else
-              num="$(ensure_issue "${title}" "${labels}" "${full_body}")"
-            fi
-
-            echo "Ensured issue: ${title} (#${num})" >&2
+            ensure_issue "${title}" "${labels}" "${full_body}" >/dev/null
+            echo "Ensured issue: ${title}" >&2
           }
 
           echo "Repo: ${REPO}" >&2
           echo "Force: ${FORCE}" >&2
-          echo "Purge: ${PURGE}" >&2
 
-          if [[ "${PURGE}" == "true" ]]; then
-            purge_all_issues_close_only
-          fi
-
-          if [[ "${FORCE}" != "true" && "${PURGE}" != "true" ]]; then
+          if [[ "${FORCE}" != "true" ]]; then
             if any_issues_exist && any_milestones_exist; then
               echo "Repo already has issues AND milestones; skipping bootstrap." >&2
               exit 0
@@ -453,8 +375,6 @@ jobs:
           # P3 (NARROWED: SPECIFICATIONS/FILTERING AS THE MAIN DRIVER)
           # =========================
 
-          create_and_assign "[P3][L] Introduce a shared base entity for Income and Transaction" "P2,size/L,type/refactor,type/tests,area/data" $'NOTE: This issue belongs in P2; if you keep it here, update labels/tags accordingly.'
-
           create_and_assign "[P3][L] Implement monthly budgets per category" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nAllow users to set monthly budgets per category and see remaining/over-budget.\n\n## Required work\n1) Add `CategoryBudget(user, yearMonth, category, amount)`.\n2) UI to create/update budgets for a month.\n3) Dashboard must show spent vs budget and remaining/over-budget per category.\n\n## Required tests\nCreate:\n- `BudgetCalculationTest.java` (service unit)\n- `CategoryBudgetRepositoryTest.java` (JPA)\n\nMust implement:\n1) `underBudget_remainingCorrect()` (unit)\n2) `overBudget_excessCorrect()` (unit)\n3) `budgetPersistsForUserMonthCategory()` (JPA)\n\n## Acceptance criteria\n- Calculations correct.\n- Persistence works.\n- All 3 tests pass.'
 
           create_and_assign "[P3][L] Recurring income/expense rules" "P3,size/L,type/feature,type/tests,area/data" $'## Goal\nSupport recurring rules and safe generation of future instances.\n\n## Required work\n1) Add recurrence rule entity (weekly/monthly).\n2) Generate instances up to a fixed horizon (e.g., next 3 months).\n3) Generation must be idempotent (no duplicates on rerun).\n4) Define and implement a month-end policy (e.g., Jan 31 -> Feb 28/29).\n\n## Required tests (service unit)\nCreate `RecurrenceGeneratorTest.java` with:\n1) `generatesExpectedInstancesWithinHorizon()`\n2) `rerunIsIdempotent_noDuplicates()`\n3) `monthEndRule_isCorrect()`\n\n## Acceptance criteria\n- No duplicates.\n- Month-end behavior correct.\n- All 3 tests pass.'
@@ -468,7 +388,7 @@ jobs:
           create_and_assign "[P3][M] Add filters using Specifications (date range + category + text)" "P3,size/M,type/feature,type/tests,area/ui,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Conditional Query Explosion / Long Parameter List** (many `if/else` paths and too many query methods)\n\n## Pattern (must name in your design note)\n- **Specification Pattern** (Spring Data JPA Specifications / Query Object)\n\n## Required work\n1) Implement filters for transactions:\n   - start date + end date\n   - category\n   - text contains (title or description)\n2) Implement filter composition using Specifications (not many repository methods).\n3) UI must allow setting all filters and preserving them on submit.\n\n## Required tests (JPA slice)\nCreate `TransactionSpecificationTest.java` with exactly these tests:\n1) `filter_dateRangeAndCategory()`\n2) `filter_categoryAndText()`\n3) `filter_allCombined()`\n\n## Required design note\n- `docs/design-notes/P3-filter-specification.md`\n\n## Acceptance criteria\n- Filters compose correctly.\n- Exactly 3 tests above pass.'
 
           # =========================
-          # P2
+          # P2 (UNCHANGED CORE: REFACTOR WITH INTENT)
           # =========================
 
           create_and_assign "[P2][L] Replace double amounts with BigDecimal (money correctness)" "P2,size/L,type/refactor,type/tests,area/data,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern (must name in your design note)\n- **Primitive Obsession** (money as primitive) and floating-point rounding errors\n\n## Pattern (must name in your design note)\n- **Value Object** (Money)\n\n## Required work\n1) Replace money fields with BigDecimal.\n2) Introduce a Money value object (wrapper) that centralizes scale and rounding.\n3) Update totals, charts, and export to use Money.\n\n## Required tests (unit)\nCreate `MoneyValueObjectTest.java` with:\n1) `addsWithFixedScale()`\n2) `classicFloatingPointExample_isCorrect()`\n\nCreate `CashflowTotalsWithMoneyTest.java` with:\n3) `summaryTotals_useMoneyAndAreCorrect()`\n\n## Required design note\n- `docs/design-notes/P2-money-value-object.md`\n\n## Acceptance criteria\n- No doubles used for money.\n- All 3 tests pass.'
@@ -488,7 +408,7 @@ jobs:
           create_and_assign "[P2][L] Introduce a shared base entity for Income and Transaction" "P2,size/L,type/refactor,type/tests,area/data" $'## Goal\nReduce duplicated entity mapping while keeping persistence correct.\n\n## Required work\n1) Introduce a `@MappedSuperclass` for shared fields.\n2) Refactor Income and Transaction to inherit.\n\n## Required tests (JPA slice)\nCreate:\n- `TransactionMappingJpaTest.java`\n- `IncomeMappingJpaTest.java`\n\nMust implement:\n1) `transaction_persistFlushClearReload_roundTripsFields()`\n2) `income_persistFlushClearReload_roundTripsFields()`\n\n## Acceptance criteria\n- Mapping works after refactor.\n- Both tests pass.'
 
           # =========================
-          # P1
+          # P1 (BASELINE + SAFETY NET)
           # =========================
 
           create_and_assign "[P1][S] Add \"empty state\" UI for new users" "P1,size/S,type/feature,type/tests,area/ui" $'## Goal\nImprove UX when the user has no incomes/transactions.\n\n## Required work\n1) Update `home.html` so when there are 0 transactions and 0 incomes:\n   - show a visible empty-state section containing the exact text: `Add your first transaction`\n   - show a visible empty-state section containing the exact text: `Add your first income`\n2) Ensure totals and charts do not throw errors on empty datasets.\n\n## Required tests (MVC)\nCreate `HomeEmptyStateMvcTest.java` with:\n1) `authenticated_noData_rendersHome()`\n2) `authenticated_noData_containsEmptyStateMarkers()`\n\n## Acceptance criteria\n- Empty state text appears exactly as specified.\n- Both tests pass.'
@@ -497,6 +417,7 @@ jobs:
 
           create_and_assign "[P1][S] Make static assets accessible on landing/login pages" "P1,size/S,type/bug,type/tests,area/security" $'## Goal\nFix security config so public pages can load the real CSS path used by this repo.\n\n## Required work\n1) Allow anonymous access to `/style.css`.\n2) Do not weaken protection of authenticated routes.\n\n## Required tests (MVC)\nCreate `StaticAssetsSecurityMvcTest.java` with exactly these tests:\n1) `anonymous_canGetStyleCss()`\n2) `anonymous_canViewLoginPage()`\n\n## Acceptance criteria\n- `/style.css` loads anonymously.\n- Both tests pass.'
 
+          # Title avoids backticks to prevent bash command substitution.
           create_and_assign "[P1][S] Fix \"/dashboard\" route (missing view)" "P1,size/S,type/bug,type/tests,area/ui" $'## Goal\nMake `/dashboard` a real, working page.\n\n## Required work\n1) Create `src/main/resources/templates/dashboard.html`.\n2) Page must display:\n   - `monthlyTotal`\n   - `totalEarnings`\n   - `netCashflow`\n3) Add heading text: `Dashboard`.\n\n## Required tests (MVC)\nCreate `DashboardMvcTest.java` with exactly these tests:\n1) `authenticated_getDashboard_returnsDashboardView()`\n2) `authenticated_getDashboard_includesRequiredModelAttributes()`\n\n## Acceptance criteria\n- Template exists and renders.\n- Both tests pass.'
 
           create_and_assign "[P1][M] Improve CSV export: consistent quoting + file name includes date" "P1,size/M,type/feature,type/tests,anchor/patterns,anchor/smells-antipatterns" $'## Smell / anti-pattern\n- **Ad-hoc String Building** (fragile CSV formatting scattered in controller)\n\n## Pattern\n- **Strategy Pattern** for cell escaping/quoting rules\n\n## Required work\n1) Extract CSV escaping/quoting into a `CsvEscaper` strategy.\n2) Handle commas, quotes, and newlines correctly.\n3) Set `Content-Disposition` filename to `transactions-YYYY-MM.csv`.\n\n## Required tests (MVC)\nCreate `CsvExportMvcTest.java` with exactly these tests:\n1) `export_escapesCommasQuotesNewlines()`\n2) `export_setsFilenameWithYearMonth()`\n\n## Required design note\n- `docs/design-notes/P1-csv-export.md`\n\n## Acceptance criteria\n- Escaping is correct.\n- Filename includes year-month.\n- Both tests pass.'
